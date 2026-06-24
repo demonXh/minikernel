@@ -63,4 +63,43 @@ public final class Libc {
     public static void yield() {
         Trap.syscall(SyscallNumber.YIELD.number());
     }
+
+    /* ---------------- file I/O ---------------- */
+
+    public static long open(String path, int flags) {
+        long vaddr = WriteBuffer.putCString(path);
+        return Trap.syscall(SyscallNumber.OPEN.number(), vaddr, flags);
+    }
+
+    public static long close(int fd) {
+        return Trap.syscall(SyscallNumber.CLOSE.number(), fd);
+    }
+
+    public static long writeFd(int fd, String s) {
+        byte[] bytes = s.getBytes();
+        long vaddr = WriteBuffer.put(bytes);
+        return Trap.syscall(SyscallNumber.WRITE.number(), fd, vaddr, bytes.length);
+    }
+
+    /** Read up to {@code maxLen} bytes from fd and return them as a String. */
+    public static String readAll(int fd, int maxLen) {
+        long vaddr = WriteBuffer.SCRATCH_ADDR;
+        long n = Trap.syscall(SyscallNumber.READ.number(), fd, vaddr, maxLen);
+        if (n <= 0) return "";
+        return WriteBuffer.fetch((int) n);
+    }
+
+    public static long lseek(int fd, long offset, int whence) {
+        return Trap.syscall(SyscallNumber.LSEEK.number(), fd, offset, whence);
+    }
+
+    public static long mkdir(String path, int mode) {
+        long vaddr = WriteBuffer.putCString(path);
+        return Trap.syscall(SyscallNumber.MKDIR.number(), vaddr, mode);
+    }
+
+    public static long unlink(String path) {
+        long vaddr = WriteBuffer.putCString(path);
+        return Trap.syscall(SyscallNumber.UNLINK.number(), vaddr);
+    }
 }

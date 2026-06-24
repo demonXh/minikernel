@@ -15,7 +15,12 @@ public enum SyscallNumber {
     WAITPID(5),
     BRK(6),
     SLEEP(7),
-    YIELD(8);
+    YIELD(8),
+    OPEN(9),
+    CLOSE(10),
+    LSEEK(11),
+    MKDIR(12),
+    UNLINK(13);
 
     private final int number;
 

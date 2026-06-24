@@ -2,6 +2,7 @@ package org.minikernel.kernel.sched;
 
 import org.minikernel.core.ds.ListHead;
 import org.minikernel.hal.Registers;
+import org.minikernel.kernel.fs.FdTable;
 import org.minikernel.kernel.mm.MmStruct;
 
 import java.util.ArrayList;
@@ -61,6 +62,9 @@ public final class TaskStruct {
     /** Memory descriptor; null for kernel threads (idle, etc.). */
     private MmStruct mm;
 
+    /** Per-process file descriptor table. */
+    private final FdTable fdTable = new FdTable();
+
     public TaskStruct(int pid, String name, TaskStruct parent, Runnable body) {
         this.pid = pid;
         this.name = name;
@@ -85,6 +89,8 @@ public final class TaskStruct {
 
     public MmStruct mm() { return mm; }
     public void setMm(MmStruct mm) { this.mm = mm; }
+
+    public FdTable fdTable() { return fdTable; }
 
     @Override
     public String toString() {

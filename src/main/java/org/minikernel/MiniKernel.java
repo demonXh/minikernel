@@ -7,6 +7,8 @@ import org.minikernel.core.time.KernelTimer;
 import org.minikernel.hal.PhysicalMemory;
 import org.minikernel.hal.VirtualClock;
 import org.minikernel.hal.VirtualCpu;
+import org.minikernel.kernel.fs.VfsCore;
+import org.minikernel.kernel.fs.ramfs.RamFs;
 import org.minikernel.kernel.mm.BuddyAllocator;
 import org.minikernel.kernel.mm.MmStruct;
 import org.minikernel.kernel.mm.Mmu;
@@ -40,6 +42,7 @@ public final class MiniKernel {
     private final BuddyAllocator buddy;
     private final Mmu mmu;
     private final SyscallTable syscalls;
+    private final VfsCore vfs;
 
     public MiniKernel(int ramBytes, long tickMillis) {
         this(ramBytes, tickMillis, DEFAULT_MAX_PIDS);
@@ -64,6 +67,8 @@ public final class MiniKernel {
         this.scheduler = new Scheduler(maxPids);
         this.syscalls = new SyscallTable(this);
         Syscalls.install(syscalls);
+        this.vfs = new VfsCore();
+        vfs.mountRoot(new RamFs());
         Trap.bind(this);
         WriteBuffer.bind(this);
         installDefaultHandlers();
@@ -77,6 +82,7 @@ public final class MiniKernel {
     public BuddyAllocator buddy() { return buddy; }
     public Mmu mmu() { return mmu; }
     public SyscallTable syscalls() { return syscalls; }
+    public VfsCore vfs() { return vfs; }
 
     public void boot() {
         KLog.info("==== MiniKernel booting ====");
@@ -133,32 +139,42 @@ public final class MiniKernel {
         MiniKernel kernel = new MiniKernel(64 * PhysicalMemory.PAGE_SIZE, 20);
         kernel.boot();
         kernel.startInit(() -> {
-            // Equip init with an address space so its heap is paged in on demand.
             kernel.scheduler().current().setMm(kernel.newProcessMm());
 
-            Libc.write(Libc.STDOUT, "init: hello from userland, pid=" + Libc.getpid());
+            Libc.write(Libc.STDOUT, "init: pid=" + Libc.getpid() + " filesystem demo");
 
-            // Allocate some heap via brk, then fork three children that each
-            // print and exit through syscalls.
-            long top = Libc.brk(2);
-            Libc.write(Libc.STDOUT, "init: brk top = 0x" + Long.toHexString(top));
+            // Make directory + file, write some data, read it back
+            int rc = (int) Libc.mkdir("/tmp", 0755);
+            Libc.write(Libc.STDOUT, "init: mkdir(/tmp) = " + rc);
 
-            for (int i = 0; i < 3; i++) {
-                final int idx = i;
-                int childPid = Libc.fork(() -> {
-                    Libc.write(Libc.STDOUT, "worker-" + idx + " says hi (pid=" + Libc.getpid() + ")");
-                    Libc.sleep(20);
-                    Libc.exit(100 + idx);
-                });
-                Libc.write(Libc.STDOUT, "init: forked child pid=" + childPid);
-            }
-            for (int i = 0; i < 3; i++) {
-                long packed = Libc.waitpid();
-                int pid = (int) (packed >>> 32);
-                int code = (int) packed;
-                Libc.write(Libc.STDOUT, "init: reaped pid=" + pid + " code=" + code);
-            }
-            Libc.write(Libc.STDOUT, "init: done, bye");
+            int fd = (int) Libc.open("/tmp/hello.txt",
+                    org.minikernel.kernel.fs.OpenFlags.O_CREAT
+                            | org.minikernel.kernel.fs.OpenFlags.O_RDWR);
+            Libc.write(Libc.STDOUT, "init: open(/tmp/hello.txt) = fd " + fd);
+
+            long w = Libc.writeFd(fd, "hello world from VFS");
+            Libc.write(Libc.STDOUT, "init: wrote " + w + " bytes");
+
+            Libc.lseek(fd, 0, 0);
+            String content = Libc.readAll(fd, 64);
+            Libc.write(Libc.STDOUT, "init: read back -> '" + content + "'");
+
+            Libc.close(fd);
+
+            // Fork a child to read the same file independently
+            int child = Libc.fork(() -> {
+                int cfd = (int) Libc.open("/tmp/hello.txt",
+                        org.minikernel.kernel.fs.OpenFlags.O_RDONLY);
+                String got = Libc.readAll(cfd, 64);
+                Libc.write(Libc.STDOUT, "child: read '" + got + "'");
+                Libc.close(cfd);
+                Libc.exit(7);
+            });
+            long packed = Libc.waitpid();
+            Libc.write(Libc.STDOUT, "init: child pid=" + child + " exited code=" + (int) packed);
+
+            Libc.unlink("/tmp/hello.txt");
+            Libc.write(Libc.STDOUT, "init: cleanup done, bye");
             Libc.exit(0);
         });
         Thread.sleep(2_000);

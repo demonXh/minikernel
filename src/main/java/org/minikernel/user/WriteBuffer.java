@@ -29,4 +29,23 @@ public final class WriteBuffer {
         }
         return SCRATCH_ADDR;
     }
+
+    /** Put a NUL-terminated copy of {@code s} into the scratch buffer. */
+    public static long putCString(String s) {
+        byte[] raw = s.getBytes();
+        byte[] withNul = new byte[raw.length + 1];
+        System.arraycopy(raw, 0, withNul, 0, raw.length);
+        return put(withNul);
+    }
+
+    /** Read {@code len} bytes back from the scratch buffer as a String. */
+    public static String fetch(int len) {
+        MiniKernel k = kernel;
+        if (k == null) throw new IllegalStateException("WriteBuffer is not bound");
+        byte[] dst = new byte[len];
+        synchronized (LOCK) {
+            k.memory().readBytes(SCRATCH_ADDR, dst, 0, len);
+        }
+        return new String(dst);
+    }
 }
