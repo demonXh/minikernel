@@ -7,6 +7,11 @@ import org.minikernel.core.time.KernelTimer;
 import org.minikernel.hal.PhysicalMemory;
 import org.minikernel.hal.VirtualClock;
 import org.minikernel.hal.VirtualCpu;
+import org.minikernel.kernel.mm.BuddyAllocator;
+import org.minikernel.kernel.mm.MmStruct;
+import org.minikernel.kernel.mm.Mmu;
+import org.minikernel.kernel.mm.PteFlags;
+import org.minikernel.kernel.mm.VmAreaStruct;
 import org.minikernel.kernel.sched.Scheduler;
 import org.minikernel.kernel.sched.TaskStruct;
 
@@ -27,6 +32,8 @@ public final class MiniKernel {
     private final VirtualCpu cpu;
     private final VirtualClock clock;
     private final Scheduler scheduler;
+    private final BuddyAllocator buddy;
+    private final Mmu mmu;
 
     public MiniKernel(int ramBytes, long tickMillis) {
         this(ramBytes, tickMillis, DEFAULT_MAX_PIDS);
@@ -34,6 +41,13 @@ public final class MiniKernel {
 
     public MiniKernel(int ramBytes, long tickMillis, int maxPids) {
         this.memory = new PhysicalMemory(ramBytes);
+        int totalFrames = ramBytes / PhysicalMemory.PAGE_SIZE;
+        if (Integer.bitCount(totalFrames) != 1) {
+            throw new IllegalArgumentException("ramBytes / PAGE_SIZE must be a power of 2 (got " + totalFrames + ")");
+        }
+        int maxOrder = Integer.numberOfTrailingZeros(totalFrames);
+        this.buddy = new BuddyAllocator(memory, 0, totalFrames, maxOrder);
+        this.mmu = new Mmu(memory);
         this.cpu = new VirtualCpu(0, interrupts);
         this.clock = new VirtualClock(cpu, tickMillis);
         this.scheduler = new Scheduler(maxPids);
@@ -45,6 +59,8 @@ public final class MiniKernel {
     public PhysicalMemory memory() { return memory; }
     public VirtualCpu cpu() { return cpu; }
     public Scheduler scheduler() { return scheduler; }
+    public BuddyAllocator buddy() { return buddy; }
+    public Mmu mmu() { return mmu; }
 
     public void boot() {
         KLog.info("==== MiniKernel booting ====");
@@ -56,6 +72,20 @@ public final class MiniKernel {
     /** Boot the scheduler with the given init task body. Returns the init TaskStruct. */
     public TaskStruct startInit(Runnable initBody) {
         return scheduler.bootstrap(initBody);
+    }
+
+    /** Build a fresh address space for a user task with default text/data/heap/stack VMAs. */
+    public MmStruct newProcessMm() {
+        MmStruct mm = new MmStruct(buddy);
+        int rw = PteFlags.WRITE | PteFlags.USER;
+        int rx = PteFlags.USER;
+        // Layout (toy): text 0x00400000+4 pages RO, data +4 pages RW, heap +4 pages RW, stack at 0x7FFFC000 4 pages RW
+        long PAGE = PhysicalMemory.PAGE_SIZE;
+        mm.addVma(new VmAreaStruct(0x00400000L, 0x00400000L + 4 * PAGE, rx, VmAreaStruct.Kind.TEXT));
+        mm.addVma(new VmAreaStruct(0x00500000L, 0x00500000L + 4 * PAGE, rw, VmAreaStruct.Kind.DATA));
+        mm.addVma(new VmAreaStruct(0x00600000L, 0x00600000L + 4 * PAGE, rw, VmAreaStruct.Kind.HEAP));
+        mm.addVma(new VmAreaStruct(0x7FFFC000L, 0x7FFFC000L + 4 * PAGE, rw, VmAreaStruct.Kind.STACK));
+        return mm;
     }
 
     public void shutdown() {
@@ -71,13 +101,16 @@ public final class MiniKernel {
             kernelTimer.onTick();
             scheduler.onTimerTick();
             long j = kernelTimer.jiffies();
-            if (j % 20 == 0) KLog.info("tick: jiffies=%d run_q=%d tasks=%d (cpu-%d)",
-                    j, scheduler.runQueueSize(), scheduler.taskCount(), c.id());
+            if (j % 20 == 0) KLog.info("tick: jiffies=%d run_q=%d tasks=%d free=%dB (cpu-%d)",
+                    j, scheduler.runQueueSize(), scheduler.taskCount(), buddy.totalFreeBytes(), c.id());
         });
         interrupts.register(InterruptVector.SHUTDOWN, (vec, c) ->
                 KLog.info("shutdown trap on cpu-%d", c.id()));
-        interrupts.register(InterruptVector.PAGE_FAULT, (vec, c) ->
-                KLog.warn("page fault on cpu-%d (no handler installed yet)", c.id()));
+        interrupts.register(InterruptVector.PAGE_FAULT, (vec, c) -> {
+            TaskStruct curr = scheduler.current();
+            KLog.warn("page fault on cpu-%d pid=%s (resolved inline by Mmu)",
+                    c.id(), curr == null ? "?" : curr.pid());
+        });
     }
 
     public static void main(String[] args) throws InterruptedException {
@@ -86,22 +119,31 @@ public final class MiniKernel {
         Scheduler sched = kernel.scheduler();
         kernel.startInit(() -> {
             KLog.info("init: hello from pid=%d", sched.current().pid());
+
+            // Equip init with its own address space and demand-page through it
+            MmStruct mm = kernel.newProcessMm();
+            sched.current().setMm(mm);
+            long heap = 0x00600000L;
+            kernel.mmu().writeBytes(mm, heap, "hello mm!".getBytes());
+            byte[] back = kernel.mmu().readBytes(mm, heap, 9);
+            KLog.info("init: heap roundtrip = '%s'", new String(back));
+
             for (int i = 0; i < 3; i++) {
                 final int idx = i;
                 sched.fork("worker-" + idx, () -> {
-                    KLog.info("worker-%d running on pid=%d", idx, sched.current().pid());
-                    for (int k = 0; k < 5; k++) {
-                        KLog.info("  worker-%d tick %d", idx, k);
-                        sched.condResched();
-                    }
+                    MmStruct childMm = kernel.newProcessMm();
+                    sched.current().setMm(childMm);
+                    long stack = 0x7FFFC000L + 16;
+                    kernel.mmu().writeByte(childMm, stack, (byte) (0x40 + idx));
+                    byte b = kernel.mmu().readByte(childMm, stack);
+                    KLog.info("worker-%d (pid=%d) wrote 0x%x to stack",
+                            idx, sched.current().pid(), b & 0xff);
                     sched.exit(idx);
                 });
             }
             for (int i = 0; i < 3; i++) {
                 long packed = sched.waitChild();
-                int pid = (int) (packed >>> 32);
-                int code = (int) packed;
-                KLog.info("init: reaped pid=%d code=%d", pid, code);
+                KLog.info("init: reaped pid=%d code=%d", (int) (packed >>> 32), (int) packed);
             }
             KLog.info("init: all workers done");
             sched.exit(0);

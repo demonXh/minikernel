@@ -2,6 +2,7 @@ package org.minikernel.kernel.sched;
 
 import org.minikernel.core.ds.ListHead;
 import org.minikernel.hal.Registers;
+import org.minikernel.kernel.mm.MmStruct;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -57,6 +58,9 @@ public final class TaskStruct {
     /** Accumulated CPU time slices (just a counter, for stats). */
     long ticksOnCpu = 0;
 
+    /** Memory descriptor; null for kernel threads (idle, etc.). */
+    private MmStruct mm;
+
     public TaskStruct(int pid, String name, TaskStruct parent, Runnable body) {
         this.pid = pid;
         this.name = name;
@@ -78,6 +82,9 @@ public final class TaskStruct {
     public int exitCode() { return exitCode; }
     public void setExitCode(int code) { this.exitCode = code; }
     public long ticksOnCpu() { return ticksOnCpu; }
+
+    public MmStruct mm() { return mm; }
+    public void setMm(MmStruct mm) { this.mm = mm; }
 
     @Override
     public String toString() {
