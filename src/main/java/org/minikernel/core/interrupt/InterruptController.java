@@ -49,6 +49,9 @@ public final class InterruptController {
         }
         try {
             h.handle(vector, cpu);
+        } catch (org.minikernel.kernel.sched.TaskExitException e) {
+            // EXIT syscall: must propagate through cpu.trap() to unwind the carrier.
+            throw e;
         } catch (Throwable t) {
             KLog.error("IRQ %d handler threw: %s", vector, t);
         }

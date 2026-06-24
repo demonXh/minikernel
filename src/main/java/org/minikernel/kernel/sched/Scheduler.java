@@ -114,7 +114,7 @@ public final class Scheduler {
         }
         KLog.debug("exit pid=%d code=%d", curr.pid(), code);
         schedule(true);
-        throw new IllegalStateException("zombie task resumed");
+        throw new TaskExitException();
     }
 
     public long waitChild() {
@@ -214,8 +214,8 @@ public final class Scheduler {
             if (t != idle && t.state() == TaskState.RUNNING) {
                 exit(0);
             }
-        } catch (IllegalStateException e) {
-            // expected: exit() throws after zombie state set; carrier ends
+        } catch (TaskExitException e) {
+            // expected: exit() throws this to unwind the carrier stack
         } catch (Throwable err) {
             KLog.error("task pid=%d crashed: %s", t.pid(), err);
             if (t != idle) {

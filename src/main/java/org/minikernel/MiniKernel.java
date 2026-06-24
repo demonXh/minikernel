@@ -14,6 +14,11 @@ import org.minikernel.kernel.mm.PteFlags;
 import org.minikernel.kernel.mm.VmAreaStruct;
 import org.minikernel.kernel.sched.Scheduler;
 import org.minikernel.kernel.sched.TaskStruct;
+import org.minikernel.syscall.Syscalls;
+import org.minikernel.syscall.SyscallTable;
+import org.minikernel.syscall.Trap;
+import org.minikernel.user.Libc;
+import org.minikernel.user.WriteBuffer;
 
 /**
  * Boot entry point of the mini kernel.
@@ -34,6 +39,7 @@ public final class MiniKernel {
     private final Scheduler scheduler;
     private final BuddyAllocator buddy;
     private final Mmu mmu;
+    private final SyscallTable syscalls;
 
     public MiniKernel(int ramBytes, long tickMillis) {
         this(ramBytes, tickMillis, DEFAULT_MAX_PIDS);
@@ -47,10 +53,19 @@ public final class MiniKernel {
         }
         int maxOrder = Integer.numberOfTrailingZeros(totalFrames);
         this.buddy = new BuddyAllocator(memory, 0, totalFrames, maxOrder);
+        // Reserve frame 0 as kernel scratch (used by user/WriteBuffer for syscall payloads).
+        int scratch = buddy.allocFrame();
+        if (scratch != 0) {
+            throw new IllegalStateException("expected frame 0 for scratch, got " + scratch);
+        }
         this.mmu = new Mmu(memory);
         this.cpu = new VirtualCpu(0, interrupts);
         this.clock = new VirtualClock(cpu, tickMillis);
         this.scheduler = new Scheduler(maxPids);
+        this.syscalls = new SyscallTable(this);
+        Syscalls.install(syscalls);
+        Trap.bind(this);
+        WriteBuffer.bind(this);
         installDefaultHandlers();
     }
 
@@ -61,6 +76,7 @@ public final class MiniKernel {
     public Scheduler scheduler() { return scheduler; }
     public BuddyAllocator buddy() { return buddy; }
     public Mmu mmu() { return mmu; }
+    public SyscallTable syscalls() { return syscalls; }
 
     public void boot() {
         KLog.info("==== MiniKernel booting ====");
@@ -79,7 +95,6 @@ public final class MiniKernel {
         MmStruct mm = new MmStruct(buddy);
         int rw = PteFlags.WRITE | PteFlags.USER;
         int rx = PteFlags.USER;
-        // Layout (toy): text 0x00400000+4 pages RO, data +4 pages RW, heap +4 pages RW, stack at 0x7FFFC000 4 pages RW
         long PAGE = PhysicalMemory.PAGE_SIZE;
         mm.addVma(new VmAreaStruct(0x00400000L, 0x00400000L + 4 * PAGE, rx, VmAreaStruct.Kind.TEXT));
         mm.addVma(new VmAreaStruct(0x00500000L, 0x00500000L + 4 * PAGE, rw, VmAreaStruct.Kind.DATA));
@@ -111,42 +126,40 @@ public final class MiniKernel {
             KLog.warn("page fault on cpu-%d pid=%s (resolved inline by Mmu)",
                     c.id(), curr == null ? "?" : curr.pid());
         });
+        interrupts.register(InterruptVector.SYSCALL, (vec, c) -> Trap.onSyscallTrap(this, syscalls));
     }
 
     public static void main(String[] args) throws InterruptedException {
         MiniKernel kernel = new MiniKernel(64 * PhysicalMemory.PAGE_SIZE, 20);
         kernel.boot();
-        Scheduler sched = kernel.scheduler();
         kernel.startInit(() -> {
-            KLog.info("init: hello from pid=%d", sched.current().pid());
+            // Equip init with an address space so its heap is paged in on demand.
+            kernel.scheduler().current().setMm(kernel.newProcessMm());
 
-            // Equip init with its own address space and demand-page through it
-            MmStruct mm = kernel.newProcessMm();
-            sched.current().setMm(mm);
-            long heap = 0x00600000L;
-            kernel.mmu().writeBytes(mm, heap, "hello mm!".getBytes());
-            byte[] back = kernel.mmu().readBytes(mm, heap, 9);
-            KLog.info("init: heap roundtrip = '%s'", new String(back));
+            Libc.write(Libc.STDOUT, "init: hello from userland, pid=" + Libc.getpid());
+
+            // Allocate some heap via brk, then fork three children that each
+            // print and exit through syscalls.
+            long top = Libc.brk(2);
+            Libc.write(Libc.STDOUT, "init: brk top = 0x" + Long.toHexString(top));
 
             for (int i = 0; i < 3; i++) {
                 final int idx = i;
-                sched.fork("worker-" + idx, () -> {
-                    MmStruct childMm = kernel.newProcessMm();
-                    sched.current().setMm(childMm);
-                    long stack = 0x7FFFC000L + 16;
-                    kernel.mmu().writeByte(childMm, stack, (byte) (0x40 + idx));
-                    byte b = kernel.mmu().readByte(childMm, stack);
-                    KLog.info("worker-%d (pid=%d) wrote 0x%x to stack",
-                            idx, sched.current().pid(), b & 0xff);
-                    sched.exit(idx);
+                int childPid = Libc.fork(() -> {
+                    Libc.write(Libc.STDOUT, "worker-" + idx + " says hi (pid=" + Libc.getpid() + ")");
+                    Libc.sleep(20);
+                    Libc.exit(100 + idx);
                 });
+                Libc.write(Libc.STDOUT, "init: forked child pid=" + childPid);
             }
             for (int i = 0; i < 3; i++) {
-                long packed = sched.waitChild();
-                KLog.info("init: reaped pid=%d code=%d", (int) (packed >>> 32), (int) packed);
+                long packed = Libc.waitpid();
+                int pid = (int) (packed >>> 32);
+                int code = (int) packed;
+                Libc.write(Libc.STDOUT, "init: reaped pid=" + pid + " code=" + code);
             }
-            KLog.info("init: all workers done");
-            sched.exit(0);
+            Libc.write(Libc.STDOUT, "init: done, bye");
+            Libc.exit(0);
         });
         Thread.sleep(2_000);
         kernel.shutdown();
