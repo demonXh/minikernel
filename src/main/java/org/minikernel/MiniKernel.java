@@ -14,6 +14,9 @@ import org.minikernel.kernel.mm.MmStruct;
 import org.minikernel.kernel.mm.Mmu;
 import org.minikernel.kernel.mm.PteFlags;
 import org.minikernel.kernel.mm.VmAreaStruct;
+import org.minikernel.kernel.net.Ipv4;
+import org.minikernel.kernel.net.NetStack;
+import org.minikernel.kernel.net.loopback.LoopbackNic;
 import org.minikernel.kernel.sched.Scheduler;
 import org.minikernel.kernel.sched.TaskStruct;
 import org.minikernel.syscall.Syscalls;
@@ -43,6 +46,8 @@ public final class MiniKernel {
     private final Mmu mmu;
     private final SyscallTable syscalls;
     private final VfsCore vfs;
+    private final NetStack netA;
+    private final NetStack netB;
 
     public MiniKernel(int ramBytes, long tickMillis) {
         this(ramBytes, tickMillis, DEFAULT_MAX_PIDS);
@@ -69,6 +74,20 @@ public final class MiniKernel {
         Syscalls.install(syscalls);
         this.vfs = new VfsCore();
         vfs.mountRoot(new RamFs());
+
+        // Two virtual hosts on a bridged link.
+        LoopbackNic nicA = new LoopbackNic("eth0",
+                new byte[]{(byte)0x52,0,0,0,0,1});
+        LoopbackNic nicB = new LoopbackNic("eth1",
+                new byte[]{(byte)0x52,0,0,0,0,2});
+        nicA.setPeer(nicB);
+        nicB.setPeer(nicA);
+        this.netA = new NetStack(interrupts, nicA, Ipv4.parse("10.0.0.1"));
+        this.netB = new NetStack(interrupts, nicB, Ipv4.parse("10.0.0.2"));
+        // Pre-load the peer's MAC into each ARP cache so the demo doesn't need ARP.
+        netA.arp().learn(netB.hostIp(), nicB.macAddress());
+        netB.arp().learn(netA.hostIp(), nicA.macAddress());
+
         Trap.bind(this);
         WriteBuffer.bind(this);
         installDefaultHandlers();
@@ -83,6 +102,8 @@ public final class MiniKernel {
     public Mmu mmu() { return mmu; }
     public SyscallTable syscalls() { return syscalls; }
     public VfsCore vfs() { return vfs; }
+    public NetStack netA() { return netA; }
+    public NetStack netB() { return netB; }
 
     public void boot() {
         KLog.info("==== MiniKernel booting ====");
@@ -138,43 +159,40 @@ public final class MiniKernel {
     public static void main(String[] args) throws InterruptedException {
         MiniKernel kernel = new MiniKernel(64 * PhysicalMemory.PAGE_SIZE, 20);
         kernel.boot();
+        int peerIp = Ipv4.parse("10.0.0.2");
+        int peerPort = 7000;
+
         kernel.startInit(() -> {
             kernel.scheduler().current().setMm(kernel.newProcessMm());
+            kernel.scheduler().current().setNetStack(kernel.netA());
 
-            Libc.write(Libc.STDOUT, "init: pid=" + Libc.getpid() + " filesystem demo");
+            Libc.write(Libc.STDOUT, "init: net demo, pid=" + Libc.getpid());
 
-            // Make directory + file, write some data, read it back
-            int rc = (int) Libc.mkdir("/tmp", 0755);
-            Libc.write(Libc.STDOUT, "init: mkdir(/tmp) = " + rc);
-
-            int fd = (int) Libc.open("/tmp/hello.txt",
-                    org.minikernel.kernel.fs.OpenFlags.O_CREAT
-                            | org.minikernel.kernel.fs.OpenFlags.O_RDWR);
-            Libc.write(Libc.STDOUT, "init: open(/tmp/hello.txt) = fd " + fd);
-
-            long w = Libc.writeFd(fd, "hello world from VFS");
-            Libc.write(Libc.STDOUT, "init: wrote " + w + " bytes");
-
-            Libc.lseek(fd, 0, 0);
-            String content = Libc.readAll(fd, 64);
-            Libc.write(Libc.STDOUT, "init: read back -> '" + content + "'");
-
-            Libc.close(fd);
-
-            // Fork a child to read the same file independently
-            int child = Libc.fork(() -> {
-                int cfd = (int) Libc.open("/tmp/hello.txt",
-                        org.minikernel.kernel.fs.OpenFlags.O_RDONLY);
-                String got = Libc.readAll(cfd, 64);
-                Libc.write(Libc.STDOUT, "child: read '" + got + "'");
-                Libc.close(cfd);
-                Libc.exit(7);
+            // Fork a child running on hostB: bind UDP 7000, recv, reply
+            int childPid = Libc.fork(() -> {
+                kernel.scheduler().current().setNetStack(kernel.netB());
+                int sd = Libc.socket(Libc.SOCK_UDP);
+                Libc.bind(sd, 7000);
+                Libc.write(Libc.STDOUT, "server: bound :7000");
+                String msg = Libc.recvfrom(sd, 256, 1000);
+                int senderIp = Libc.lastSenderIp();
+                int senderPort = Libc.lastSenderPort();
+                Libc.write(Libc.STDOUT, "server: got '" + msg + "' from "
+                        + Ipv4.format(senderIp) + ":" + senderPort);
+                Libc.sendto(sd, ("pong:" + msg).getBytes(), senderIp, senderPort);
+                Libc.exit(0);
             });
-            long packed = Libc.waitpid();
-            Libc.write(Libc.STDOUT, "init: child pid=" + child + " exited code=" + (int) packed);
 
-            Libc.unlink("/tmp/hello.txt");
-            Libc.write(Libc.STDOUT, "init: cleanup done, bye");
+            Libc.sleep(50); // let server bind
+            int clientSd = Libc.socket(Libc.SOCK_UDP);
+            Libc.bind(clientSd, 5000);
+            Libc.sendto(clientSd, "hello-net".getBytes(), peerIp, peerPort);
+            Libc.write(Libc.STDOUT, "client: sent hello-net to 10.0.0.2:7000");
+            String reply = Libc.recvfrom(clientSd, 256, 1000);
+            Libc.write(Libc.STDOUT, "client: got reply '" + reply + "'");
+
+            Libc.waitpid();
+            Libc.write(Libc.STDOUT, "init: child pid=" + childPid + " done, bye");
             Libc.exit(0);
         });
         Thread.sleep(2_000);

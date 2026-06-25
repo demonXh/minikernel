@@ -8,6 +8,11 @@ import org.minikernel.kernel.fs.VfsCore;
 import org.minikernel.kernel.mm.MmStruct;
 import org.minikernel.kernel.mm.Mmu;
 import org.minikernel.kernel.mm.SegfaultException;
+import org.minikernel.kernel.net.Datagram;
+import org.minikernel.kernel.net.NetStack;
+import org.minikernel.kernel.net.SocketTable;
+import org.minikernel.kernel.net.SocketType;
+import org.minikernel.kernel.net.UdpSocket;
 import org.minikernel.kernel.sched.Scheduler;
 import org.minikernel.kernel.sched.TaskStruct;
 
@@ -36,6 +41,10 @@ public final class Syscalls {
         table.register(SyscallNumber.LSEEK,   Syscalls::sysLseek);
         table.register(SyscallNumber.MKDIR,   Syscalls::sysMkdir);
         table.register(SyscallNumber.UNLINK,  Syscalls::sysUnlink);
+        table.register(SyscallNumber.SOCKET,  Syscalls::sysSocket);
+        table.register(SyscallNumber.BIND,    Syscalls::sysBind);
+        table.register(SyscallNumber.SENDTO,  Syscalls::sysSendto);
+        table.register(SyscallNumber.RECVFROM,Syscalls::sysRecvfrom);
     }
 
     static long sysRead(SyscallContext ctx) {
@@ -219,6 +228,84 @@ public final class Syscalls {
         try { path = readUserString(ctx, pathVaddr); }
         catch (SegfaultException e) { return Errno.fail(Errno.EFAULT); }
         return ctx.kernel().vfs().unlink(path) ? 0L : Errno.fail(Errno.ENOENT);
+    }
+
+    /* ---------------- networking ---------------- */
+
+    static long sysSocket(SyscallContext ctx) {
+        int type = ctx.argInt(0); // 0=UDP, 1=TCP (TCP unimplemented for now)
+        TaskStruct t = ctx.caller();
+        if (t == null) return Errno.fail(Errno.EFAULT);
+        if (type != SocketType.UDP.ordinal()) return Errno.fail(Errno.EINVAL);
+        UdpSocket s = new UdpSocket();
+        return t.sockTable().install(s);
+    }
+
+    static long sysBind(SyscallContext ctx) {
+        int handle = ctx.argInt(0);
+        int port = ctx.argInt(1);
+        TaskStruct t = ctx.caller();
+        if (t == null) return Errno.fail(Errno.EFAULT);
+        UdpSocket s = t.sockTable().get(handle);
+        if (s == null) return Errno.fail(Errno.EBADF);
+        NetStack ns = t.netStack();
+        if (ns == null) return Errno.fail(Errno.EINVAL);
+        return ns.bindUdp(s, port) ? 0L : Errno.fail(Errno.EINVAL);
+    }
+
+    static long sysSendto(SyscallContext ctx) {
+        int handle = ctx.argInt(0);
+        long bufVaddr = ctx.arg(1);
+        int len = ctx.argInt(2);
+        int dstIp = ctx.argInt(3);
+        int dstPort = ctx.argInt(4);
+        TaskStruct t = ctx.caller();
+        if (t == null) return Errno.fail(Errno.EFAULT);
+        UdpSocket s = t.sockTable().get(handle);
+        if (s == null) return Errno.fail(Errno.EBADF);
+        NetStack ns = t.netStack();
+        if (ns == null) return Errno.fail(Errno.EINVAL);
+        // Auto-bind to an ephemeral port if not already bound.
+        if (!s.isBound()) ns.bindUdp(s, allocEphemeralPort(ns));
+        byte[] payload;
+        try { payload = readUserBuffer(ctx, bufVaddr, len); }
+        catch (SegfaultException e) { return Errno.fail(Errno.EFAULT); }
+        ns.sendUdp(dstIp, s.localPort(), dstPort, payload);
+        return len;
+    }
+
+    static long sysRecvfrom(SyscallContext ctx) {
+        int handle = ctx.argInt(0);
+        long bufVaddr = ctx.arg(1);
+        int len = ctx.argInt(2);
+        long timeoutMs = ctx.arg(3);
+        TaskStruct t = ctx.caller();
+        if (t == null) return Errno.fail(Errno.EFAULT);
+        UdpSocket s = t.sockTable().get(handle);
+        if (s == null) return Errno.fail(Errno.EBADF);
+        // Cooperative wait: poll the queue while yielding the CPU so other
+        // tasks (notably the sender, possibly on the same single-CPU model)
+        // can run and softirqd can deliver the packet.
+        long deadline = (timeoutMs < 0) ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMs;
+        Datagram d = s.tryReceive();
+        while (d == null && System.currentTimeMillis() < deadline) {
+            ctx.kernel().scheduler().yieldCpu();
+            try { Thread.sleep(1); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            d = s.tryReceive();
+        }
+        if (d == null) return Errno.fail(Errno.EINTR);
+        int n = Math.min(len, d.payload.length);
+        try { writeUserBuffer(ctx, bufVaddr, d.payload, n); }
+        catch (SegfaultException e) { return Errno.fail(Errno.EFAULT); }
+        LastDatagram.set(d.srcIp, d.srcPort);
+        return n;
+    }
+
+    private static int allocEphemeralPort(NetStack ns) {
+        for (int p = 49152; p < 65535; p++) {
+            if (ns.lookupUdp(p) == null) return p;
+        }
+        return 0;
     }
 
     // ----- helpers for copying buffers across the user/kernel boundary -----

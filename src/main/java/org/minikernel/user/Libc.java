@@ -102,4 +102,36 @@ public final class Libc {
         long vaddr = WriteBuffer.putCString(path);
         return Trap.syscall(SyscallNumber.UNLINK.number(), vaddr);
     }
+
+    /* ---------------- networking ---------------- */
+
+    public static final int SOCK_UDP = 0;
+
+    public static int socket(int type) {
+        return (int) Trap.syscall(SyscallNumber.SOCKET.number(), type);
+    }
+
+    public static long bind(int sd, int port) {
+        return Trap.syscall(SyscallNumber.BIND.number(), sd, port);
+    }
+
+    public static long sendto(int sd, byte[] payload, int dstIp, int dstPort) {
+        long vaddr = WriteBuffer.put(payload);
+        return Trap.syscall(SyscallNumber.SENDTO.number(), sd, vaddr, payload.length, dstIp, dstPort);
+    }
+
+    /** Returns received bytes as a String, or empty string on timeout. */
+    public static String recvfrom(int sd, int maxLen, long timeoutMs) {
+        long n = Trap.syscall(SyscallNumber.RECVFROM.number(), sd, WriteBuffer.SCRATCH_ADDR, maxLen, timeoutMs);
+        if (n <= 0) return "";
+        return WriteBuffer.fetch((int) n);
+    }
+
+    public static int lastSenderIp() {
+        return org.minikernel.syscall.LastDatagram.lastSrcIp();
+    }
+
+    public static int lastSenderPort() {
+        return org.minikernel.syscall.LastDatagram.lastSrcPort();
+    }
 }

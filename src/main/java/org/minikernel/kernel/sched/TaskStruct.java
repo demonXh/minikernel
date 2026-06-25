@@ -4,6 +4,7 @@ import org.minikernel.core.ds.ListHead;
 import org.minikernel.hal.Registers;
 import org.minikernel.kernel.fs.FdTable;
 import org.minikernel.kernel.mm.MmStruct;
+import org.minikernel.kernel.net.SocketTable;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -65,6 +66,12 @@ public final class TaskStruct {
     /** Per-process file descriptor table. */
     private final FdTable fdTable = new FdTable();
 
+    /** Per-process socket descriptor table. */
+    private final SocketTable sockTable = new SocketTable();
+
+    /** Network stack this task is attached to; null if no networking. */
+    private org.minikernel.kernel.net.NetStack netStack;
+
     public TaskStruct(int pid, String name, TaskStruct parent, Runnable body) {
         this.pid = pid;
         this.name = name;
@@ -91,6 +98,11 @@ public final class TaskStruct {
     public void setMm(MmStruct mm) { this.mm = mm; }
 
     public FdTable fdTable() { return fdTable; }
+
+    public SocketTable sockTable() { return sockTable; }
+
+    public org.minikernel.kernel.net.NetStack netStack() { return netStack; }
+    public void setNetStack(org.minikernel.kernel.net.NetStack ns) { this.netStack = ns; }
 
     @Override
     public String toString() {

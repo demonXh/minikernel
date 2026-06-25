@@ -20,7 +20,11 @@ public enum SyscallNumber {
     CLOSE(10),
     LSEEK(11),
     MKDIR(12),
-    UNLINK(13);
+    UNLINK(13),
+    SOCKET(14),
+    BIND(15),
+    SENDTO(16),
+    RECVFROM(17);
 
     private final int number;
 
